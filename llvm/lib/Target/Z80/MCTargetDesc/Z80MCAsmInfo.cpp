@@ -137,6 +137,12 @@ void Z80MCAsmInfoSDCC::printSwitchToSection(const MCSection &Section,
                                             raw_ostream &OS) const {
   StringRef Name = Section.getName();
 
+  if (T.getEnvironment() == Triple::SDCC &&
+      (Name == "_INITIALIZED" || Name == "_INITIALIZER")) {
+    OS << "\t.area\t" << Name << "\n";
+    return;
+  }
+
   // Map ELF section names to sdasz80 .area directives
   if (Name == ".text" || Name.starts_with(".text."))
     OS << "\t.area\t_CODE\n";
