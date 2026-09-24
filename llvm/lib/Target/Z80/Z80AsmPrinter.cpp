@@ -192,7 +192,8 @@ void Z80AsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
     // BSS locals: sdasz80 doesn't support .local/.comm directives.
     // Handle zero-initialized variables by emitting in _DATA with explicit
     // zero bytes. (.ds in sdasz80 reserves space but does NOT zero-initialize.)
-    if (GV->hasLocalLinkage() &&
+    if (!GV->isConstant() &&
+        GV->hasLocalLinkage() &&
         (!GV->hasInitializer() || GV->getInitializer()->isNullValue())) {
       MCSymbol *GVSym = getSymbol(GV);
       const DataLayout &DL = GV->getDataLayout();
