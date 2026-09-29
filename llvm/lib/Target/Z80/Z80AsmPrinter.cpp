@@ -193,6 +193,7 @@ void Z80AsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
     // Handle zero-initialized variables by emitting in _DATA with explicit
     // zero bytes. (.ds in sdasz80 reserves space but does NOT zero-initialize.)
     if (!GV->isConstant() &&
+        !GV->hasSection() &&
         GV->hasLocalLinkage() &&
         (!GV->hasInitializer() || GV->getInitializer()->isNullValue())) {
       MCSymbol *GVSym = getSymbol(GV);
