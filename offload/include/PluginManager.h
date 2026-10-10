@@ -141,14 +141,7 @@ struct PluginManager {
   void addRequirements(int64_t Flags) { Requirements.addRequirements(Flags); }
 
   /// Returns the number of plugins that are active.
-  int getNumActivePlugins() const {
-    int count = 0;
-    for (auto &R : plugins())
-      if (R.is_initialized())
-        ++count;
-
-    return count;
-  }
+  int getNumActivePlugins() const;
 
 private:
   bool RTLsLoaded = false;
@@ -207,7 +200,7 @@ ol_result_t iterate(IterateFn Func, CallbackTy Callback, void *UserData) {
   struct {
     CallbackTy *Callback;
     void *UserData;
-  } WrapperData;
+  } WrapperData = {&Callback, UserData};
   auto Wrapper = [](ElemTy Elem, void *UserData) -> bool {
     auto *Unwrapped = static_cast<decltype(WrapperData) *>(UserData);
     (*Unwrapped->Callback)(Elem, Unwrapped->UserData);
