@@ -94,6 +94,7 @@ def IsX86_32 : LibcallPredicate<[{TT.getArch() == Triple::x86}]>;
 def IsX86_64 : LibcallPredicate<[{TT.getArch() == Triple::x86_64}]>;
 def IsX86 : LibcallPredicate<[{TT.isX86()}]>;
 def IsXCore : LibcallPredicate<[{TT.getArch() == Triple::xcore}]>;
+def IsZ80Family : LibcallPredicate<[{TT.isZ80Family()}]>;
 
 def IsOSzOS : LibcallPredicate<[{TT.isOSzOS()}]>;
 def IsSystemZ : LibcallPredicate<[{TT.isSystemZ()}]>;
@@ -112,8 +113,6 @@ def IsArchCSKY : LibcallPredicate<[{TT.getArch() == Triple::csky}]>;
 def IsArchArc : LibcallPredicate<[{TT.getArch() == Triple::arc}]>;
 def IsArchM68k : LibcallPredicate<[{TT.getArch() == Triple::m68k}]>;
 def IsArchXtensa : LibcallPredicate<[{TT.getArch() == Triple::xtensa}]>;
-def IsArchZ80 : LibcallPredicate<[{TT.getArch() == Triple::z80}]>;
-def IsArchSM83 : LibcallPredicate<[{TT.getArch() == Triple::sm83}]>;
 
 /// Libcall Predicates
 def isOSDarwin : RuntimeLibcallAvailability<(all_of IsOSDarwin)>;
@@ -3724,6 +3723,35 @@ def XCoreSystemLibrary
          XCoreLibc, XCoreLibm)>;
 
 //===----------------------------------------------------------------------===//
+// Z80 Runtime Libcalls
+//===----------------------------------------------------------------------===//
+
+// Compiler-emitted block copies use these instead of the C routines, which
+// take the length on the stack. They take every argument in a register and
+// return nothing, like ARM's __aeabi_mem*.
+def __z80_memcpy_builtin : RuntimeLibcallImpl<MEMCPY>;
+def __z80_memmove_builtin : RuntimeLibcallImpl<MEMMOVE>;
+def __z80_memset_builtin : RuntimeLibcallImpl<MEMSET>;
+
+def Z80MemCalls : LibcallsWithCC<
+  (add __z80_memcpy_builtin, __z80_memmove_builtin, __z80_memset_builtin),
+  Z80_BUILTIN>;
+
+def isZ80Family : RuntimeLibcallAvailability<(all_of IsZ80Family)>;
+
+def Z80CompilerRt : LibcallLibrary<"compiler-rt",
+  (add Z80MemCalls), isZ80Family>;
+
+def Z80SystemLibrary
+    : SystemRuntimeLibrary<isZ80Family,
+    (add CompilerRtLibgcc,
+         Z80CompilerRt,
+         Libm,
+         // Replaced by Z80MemCalls.
+         LibraryRef<Libc, [memcpy, memmove, memset]>,
+         ExceptionRuntime)>;
+
+//===----------------------------------------------------------------------===//
 // ZOS Runtime Libcalls
 //===----------------------------------------------------------------------===//
 
@@ -4753,38 +4781,6 @@ defset list<RuntimeLibcallImpl> ARMPL_VECFUNCS = {
   def armpl_vtgammaq_f32 : RuntimeLibcallImpl<TGAMMA_V4F32>;
   def armpl_vtgammaq_f64 : RuntimeLibcallImpl<TGAMMA_V2F64>;
 }
-
-//===----------------------------------------------------------------------===//
-// Z80 / SM83 Runtime Libcalls
-//===----------------------------------------------------------------------===//
-
-// The SDCC ABI puts the length on the stack, so the C routines build a frame
-// to read it back and clean up on the way out.  These stand-ins take every
-// argument in a register and drop the returned destination, as ARM's
-// __aeabi_mem* routines do.  The C entry points stay in the runtime for source
-// that calls them by name.
-def __z80_memcpy_builtin : RuntimeLibcallImpl<MEMCPY>;
-def __z80_memmove_builtin : RuntimeLibcallImpl<MEMMOVE>;
-def __z80_memset_builtin : RuntimeLibcallImpl<MEMSET>;
-
-def Z80MemCalls : LibcallsWithCC<
-  (add __z80_memcpy_builtin, __z80_memmove_builtin, __z80_memset_builtin),
-  Z80_BUILTIN>;
-
-def isZ80Family : RuntimeLibcallAvailability<(any_of IsArchZ80, IsArchSM83)>;
-
-// The legacy default arm, with the three block routines swapped for the
-// register-argument forms.  Its 128-bit and fp128 long-double sets are left
-// out; neither predicate holds on a 16-bit target.
-def Z80SystemLibrary
-    : SystemRuntimeLibrary<isZ80Family,
-      (add (sub DefaultRuntimeLibcallImpls,
-                memcpy, memmove, memset),
-           Z80MemCalls,
-           LibmHasSinCosF32, LibmHasSinCosF64,
-           exp10f, exp10, exp10l_f128,
-           __powisf2, __powidf2, __powitf2_f128,
-           DefaultStackProtector, DefaultSafeStackGlobals)>;
 
 //===----------------------------------------------------------------------===//
 // AMD vector math library (AMDLIBM) functions
