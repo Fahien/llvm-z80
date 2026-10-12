@@ -39,6 +39,21 @@ namespace {
 #include "Z80GenPreLegalizeGICombiner.inc"
 #undef GET_GICOMBINER_TYPES
 
+// Whether a 16-bit G_SDIV or G_SREM can run as a byte division: its operands
+// fit in a signed byte, and it is not under minsize, by a power of two, or
+// paired with the matching quotient or remainder.
+bool canDivideInByte(MachineInstr &MI, const CombinerHelper &Helper) {
+  MachineInstr *Other;
+  if (MI.getMF()->getFunction().hasMinSize() ||
+      Helper.matchOperandIsKnownToBeAPowerOfTwo(MI.getOperand(2),
+                                                /*OrNegative=*/true) ||
+      Helper.matchCombineDivRem(MI, Other))
+    return false;
+  GISelValueTracking &VT = *Helper.getValueTracking();
+  return VT.computeNumSignBits(MI.getOperand(1).getReg()) > 8 &&
+         VT.computeNumSignBits(MI.getOperand(2).getReg()) > 8;
+}
+
 class Z80PreLegalizerCombinerImpl : public Combiner {
 protected:
   const CombinerHelper Helper;

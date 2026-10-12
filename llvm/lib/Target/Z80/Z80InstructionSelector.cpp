@@ -51,13 +51,10 @@ public:
   static const char *getName() { return DEBUG_TYPE; }
 
 private:
-  bool selectRuntimeLibCall16(MachineInstr &MI, const char *FuncName);
   bool selectInline16(MachineInstr &MI, unsigned PseudoOpc);
   bool selectMul8(MachineInstr &MI);
-  bool selectMulByConst(MachineInstr &MI);
   bool selectUDivMod8(MachineInstr &MI, bool IsDiv);
   bool selectSDivMod8(MachineInstr &MI, bool IsDiv);
-  bool tryNarrowSRem16(MachineInstr &MI);
   bool emitFusedCompareAndBranch(MachineBasicBlock &MBB, MachineInstr &MI,
                                  MachineInstr &CmpMI, MachineRegisterInfo &MRI);
   std::optional<Register> emitEqualityTest(MachineBasicBlock &MBB,
@@ -295,66 +292,6 @@ Z80InstructionSelector::countFoldablePatternsInBB(MachineBasicBlock &MBB,
   return Count;
 }
 
-// Emit a runtime library call for 16-bit binary ops.
-// Z80:  HL=Src1, DE=Src2, result in DE  (__sdcccall(1))
-// SM83: DE=Src1, BC=Src2, result in BC  (__sdcccall(1))
-bool Z80InstructionSelector::selectRuntimeLibCall16(MachineInstr &MI,
-                                                    const char *FuncName) {
-  MachineBasicBlock &MBB = *MI.getParent();
-  MachineFunction &MF = *MBB.getParent();
-  MachineRegisterInfo &MRI = MF.getRegInfo();
-  const auto &STI = MF.getSubtarget<Z80Subtarget>();
-
-  Register DstReg = MI.getOperand(0).getReg();
-  Register Src1Reg = MI.getOperand(1).getReg();
-  Register Src2Reg = MI.getOperand(2).getReg();
-
-  if (MRI.getType(DstReg).getSizeInBits() > 16)
-    return false;
-
-  if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
-      !RBI.constrainGenericRegister(Src1Reg, Z80::GR16RegClass, MRI) ||
-      !RBI.constrainGenericRegister(Src2Reg, Z80::GR16RegClass, MRI))
-    return false;
-
-  Module *M = const_cast<Module *>(MF.getFunction().getParent());
-  FunctionCallee Func = M->getOrInsertFunction(
-      FuncName, FunctionType::get(Type::getInt16Ty(M->getContext()),
-                                  {Type::getInt16Ty(M->getContext()),
-                                   Type::getInt16Ty(M->getContext())},
-                                  false));
-  GlobalValue *GV = cast<GlobalValue>(Func.getCallee());
-
-  if (STI.hasSM83()) {
-    // SM83: 1st arg→DE, 2nd arg→BC, return→BC
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::DE)
-        .addReg(Src1Reg);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::BC)
-        .addReg(Src2Reg);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::CALL_nn))
-        .addGlobalAddress(GV)
-        .addUse(Z80::DE, RegState::Implicit)
-        .addUse(Z80::BC, RegState::Implicit);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-        .addReg(Z80::BC);
-  } else {
-    // Z80: 1st arg→HL, 2nd arg→DE, return→DE
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::HL)
-        .addReg(Src1Reg);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::DE)
-        .addReg(Src2Reg);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::CALL_nn))
-        .addGlobalAddress(GV)
-        .addUse(Z80::HL, RegState::Implicit)
-        .addUse(Z80::DE, RegState::Implicit);
-    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-        .addReg(Z80::DE);
-  }
-
-  MI.eraseFromParent();
-  return true;
-}
-
 // Select 16-bit ops via inline pseudo (for +inline-i16-runtime mode).
 // Input: HL = src1, DE = src2. Output: DE = result.
 // The pseudo is expanded in Z80ExpandPseudo.
@@ -420,9 +357,7 @@ bool Z80InstructionSelector::selectMul8(MachineInstr &MI) {
 
 // Select G_UDIV/G_UREM i8: inline 8-bit restoring division via pseudo.
 // Input: A = dividend, E = divisor. Output: A = quotient (UDIV8) or remainder
-// (UMOD8). The call is shorter than the inline loop but costs the time of
-// getting there, so only minsize takes it. SM83 calls either way: the
-// instructions the loop is missing there make it lose on both counts.
+// (UMOD8).
 bool Z80InstructionSelector::selectUDivMod8(MachineInstr &MI, bool IsDiv) {
   MachineBasicBlock &MBB = *MI.getParent();
   MachineFunction &MF = *MBB.getParent();
@@ -436,41 +371,6 @@ bool Z80InstructionSelector::selectUDivMod8(MachineInstr &MI, bool IsDiv) {
     return false;
 
   const DebugLoc &DL = MI.getDebugLoc();
-
-  if (MF.getSubtarget<Z80Subtarget>().hasSM83() ||
-      MF.getFunction().hasMinSize()) {
-    // Call the dedicated 8-bit runtime function instead.  There is no RTLIB
-    // slot for it, so the call is built by hand, but it follows
-    // CallingConv::Z80_Builtin: dividend in A, divisor in the low half of the
-    // first argument pair, result in A.
-    if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-        !RBI.constrainGenericRegister(Src1Reg, Z80::GR8RegClass, MRI) ||
-        !RBI.constrainGenericRegister(Src2Reg, Z80::GR8RegClass, MRI))
-      return false;
-
-    const char *FuncName = IsDiv ? "__udivqi3" : "__umodqi3";
-    Module *M = const_cast<Module *>(MF.getFunction().getParent());
-    FunctionCallee Func = M->getOrInsertFunction(
-        FuncName, FunctionType::get(Type::getInt8Ty(M->getContext()),
-                                    {Type::getInt8Ty(M->getContext()),
-                                     Type::getInt8Ty(M->getContext())},
-                                    false));
-    GlobalValue *GV = cast<GlobalValue>(Func.getCallee());
-
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::A).addReg(Src1Reg);
-    Register DivisorReg =
-        MF.getSubtarget<Z80Subtarget>().hasSM83() ? Z80::E : Z80::L;
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DivisorReg)
-        .addReg(Src2Reg);
-    BuildMI(MBB, MI, DL, TII.get(Z80::CALL_nn))
-        .addGlobalAddress(GV)
-        .addUse(Z80::A, RegState::Implicit)
-        .addUse(DivisorReg, RegState::Implicit);
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(Z80::A);
-
-    MI.eraseFromParent();
-    return true;
-  }
 
   if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
       !RBI.constrainGenericRegister(Src1Reg, Z80::GR8RegClass, MRI) ||
@@ -487,7 +387,7 @@ bool Z80InstructionSelector::selectUDivMod8(MachineInstr &MI, bool IsDiv) {
 
 // Select G_SDIV/G_SREM i8: inline 8-bit signed division via pseudo.
 // Input: A = dividend, E = divisor. Output: A = quotient (SDIV8) or remainder
-// (SMOD8). Under -Oz, emits a runtime call instead to save code size.
+// (SMOD8).
 bool Z80InstructionSelector::selectSDivMod8(MachineInstr &MI, bool IsDiv) {
   MachineBasicBlock &MBB = *MI.getParent();
   MachineFunction &MF = *MBB.getParent();
@@ -502,52 +402,6 @@ bool Z80InstructionSelector::selectSDivMod8(MachineInstr &MI, bool IsDiv) {
 
   const DebugLoc &DL = MI.getDebugLoc();
 
-  if (MF.getFunction().hasMinSize()) {
-    // -Oz: sign-extend i8 operands to i16, call __divhi3/__modhi3,
-    // and truncate the result back to i8.
-    if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-        !RBI.constrainGenericRegister(Src1Reg, Z80::GR8RegClass, MRI) ||
-        !RBI.constrainGenericRegister(Src2Reg, Z80::GR8RegClass, MRI))
-      return false;
-
-    const char *FuncName = IsDiv ? "__divhi3" : "__modhi3";
-    Module *M = const_cast<Module *>(MF.getFunction().getParent());
-    FunctionCallee Func = M->getOrInsertFunction(
-        FuncName, FunctionType::get(Type::getInt16Ty(M->getContext()),
-                                    {Type::getInt16Ty(M->getContext()),
-                                     Type::getInt16Ty(M->getContext())},
-                                    false));
-    GlobalValue *GV = cast<GlobalValue>(Func.getCallee());
-    const auto &STI = MF.getSubtarget<Z80Subtarget>();
-
-    if (STI.hasSM83()) {
-      // SM83: 1st→DE, 2nd→BC, return→BC
-      BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::DE)
-          .addReg(Src1Reg);
-      BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::BC)
-          .addReg(Src2Reg);
-      BuildMI(MBB, MI, DL, TII.get(Z80::CALL_nn))
-          .addGlobalAddress(GV)
-          .addUse(Z80::DE, RegState::Implicit)
-          .addUse(Z80::BC, RegState::Implicit);
-      BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(Z80::C);
-    } else {
-      // Z80: 1st→HL, 2nd→DE, return→DE
-      BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::HL)
-          .addReg(Src1Reg);
-      BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::DE)
-          .addReg(Src2Reg);
-      BuildMI(MBB, MI, DL, TII.get(Z80::CALL_nn))
-          .addGlobalAddress(GV)
-          .addUse(Z80::HL, RegState::Implicit)
-          .addUse(Z80::DE, RegState::Implicit);
-      BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(Z80::E);
-    }
-
-    MI.eraseFromParent();
-    return true;
-  }
-
   if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
       !RBI.constrainGenericRegister(Src1Reg, Z80::GR8RegClass, MRI) ||
       !RBI.constrainGenericRegister(Src2Reg, Z80::GR8RegClass, MRI))
@@ -556,171 +410,6 @@ bool Z80InstructionSelector::selectSDivMod8(MachineInstr &MI, bool IsDiv) {
   BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::E).addReg(Src2Reg);
   buildAccOp(MBB, MI, DL, IsDiv ? Z80::SDIV8 : Z80::SMOD8, DstReg, Src1Reg,
              MRI);
-
-  MI.eraseFromParent();
-  return true;
-}
-
-// Try to narrow G_SREM i16 to i8 when both operands are G_SEXT from i8.
-// Fallback for when G_TRUNC fold doesn't apply (i16 result used directly).
-// G_SDIV is not narrowed here: -128 / -1 is 128, which no i8 quotient holds.
-bool Z80InstructionSelector::tryNarrowSRem16(MachineInstr &MI) {
-  MachineBasicBlock &MBB = *MI.getParent();
-  MachineFunction &MF = *MBB.getParent();
-  MachineRegisterInfo &MRI = MF.getRegInfo();
-
-  Register DstReg = MI.getOperand(0).getReg();
-  Register Src1Reg = MI.getOperand(1).getReg();
-  Register Src2Reg = MI.getOperand(2).getReg();
-
-  if (MRI.getType(DstReg).getSizeInBits() != 16)
-    return false;
-
-  // Check if both operands come from G_SEXT i8 → i16.
-  MachineInstr *Src1Def = MRI.getVRegDef(Src1Reg);
-  MachineInstr *Src2Def = MRI.getVRegDef(Src2Reg);
-  if (!Src1Def || !Src2Def)
-    return false;
-  if (Src1Def->getOpcode() != TargetOpcode::G_SEXT ||
-      Src2Def->getOpcode() != TargetOpcode::G_SEXT)
-    return false;
-
-  Register Orig1 = Src1Def->getOperand(1).getReg();
-  Register Orig2 = Src2Def->getOperand(1).getReg();
-  if (MRI.getType(Orig1).getSizeInBits() != 8 ||
-      MRI.getType(Orig2).getSizeInBits() != 8)
-    return false;
-
-  // Under -Oz, let the normal __modhi3 path handle it.
-  if (MF.getFunction().hasMinSize())
-    return false;
-
-  const DebugLoc &DL = MI.getDebugLoc();
-
-  // Inline 8-bit signed remainder, then sign-extend result to i16.
-  if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
-      !RBI.constrainGenericRegister(Orig1, Z80::GR8RegClass, MRI) ||
-      !RBI.constrainGenericRegister(Orig2, Z80::GR8RegClass, MRI))
-    return false;
-
-  BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::E).addReg(Orig2);
-  Register Rem = emitAccUnary(MBB, MI, DL, Z80::SMOD8, Orig1, MRI);
-  // Sign-extend the 8-bit result to the 16-bit destination.
-  BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), DstReg).addReg(Rem);
-
-  MI.eraseFromParent();
-  return true;
-}
-
-// Try to select G_MUL with a constant operand as inline shift-add sequence.
-// This avoids the expensive __mulhi3 runtime call for small constants.
-// Decomposition: x * C is expressed as a chain of ADD HL,HL (shift by 1)
-// and ADD HL,rr (add original value), built by factoring out 2s and 1s.
-// Example: x * 10 = ((x << 2) + x) << 1 → SHIFT,SHIFT,ADD,SHIFT
-bool Z80InstructionSelector::selectMulByConst(MachineInstr &MI) {
-  MachineBasicBlock &MBB = *MI.getParent();
-  MachineFunction &MF = *MBB.getParent();
-  MachineRegisterInfo &MRI = MF.getRegInfo();
-
-  Register DstReg = MI.getOperand(0).getReg();
-  Register Src0 = MI.getOperand(1).getReg();
-  Register Src1 = MI.getOperand(2).getReg();
-
-  if (MRI.getType(DstReg).getSizeInBits() != 16)
-    return false;
-
-  // Find the constant operand
-  auto getConstVal = [&](Register Reg) -> std::optional<uint64_t> {
-    MachineInstr *Def = MRI.getVRegDef(Reg);
-    if (Def && Def->getOpcode() == TargetOpcode::G_CONSTANT)
-      return Def->getOperand(1).getCImm()->getZExtValue() & 0xFFFF;
-    return std::nullopt;
-  };
-
-  Register SrcReg;
-  uint64_t C;
-  if (auto Val = getConstVal(Src1)) {
-    SrcReg = Src0;
-    C = *Val;
-  } else if (auto Val = getConstVal(Src0)) {
-    SrcReg = Src1;
-    C = *Val;
-  } else {
-    return false;
-  }
-
-  const DebugLoc &DL = MI.getDebugLoc();
-
-  // x * 0: result is always 0.
-  if (C == 0) {
-    if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI))
-      return false;
-    Z80::buildLD16n(MBB, MI, DL, TII, Z80::HL).addImm(0);
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(Z80::HL);
-    MI.eraseFromParent();
-    return true;
-  }
-
-  // x * 1: result is x (identity).
-  if (C == 1) {
-    if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
-        !RBI.constrainGenericRegister(SrcReg, Z80::GR16RegClass, MRI))
-      return false;
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(SrcReg);
-    MI.eraseFromParent();
-    return true;
-  }
-
-  // Decompose C into a sequence of SHIFT (×2) and ADD_ORIG (+x) steps.
-  // Algorithm: work from C down to 1:
-  //   even → SHIFT, C/=2
-  //   odd  → ADD_ORIG, C-=1
-  // Then reverse to get execution order.
-  enum StepKind { SHIFT, ADD_ORIG };
-  SmallVector<StepKind, 16> Steps;
-  uint64_t Remaining = C;
-  while (Remaining != 1) {
-    if (Remaining % 2 == 0) {
-      Steps.push_back(SHIFT);
-      Remaining /= 2;
-    } else {
-      Steps.push_back(ADD_ORIG);
-      Remaining -= 1;
-    }
-  }
-  std::reverse(Steps.begin(), Steps.end());
-
-  // Limit: if too many steps, fall back to library call.
-  // Each step is ~11 T-states; __mulhi3 is ~300+ T-states.
-  if (Steps.size() > 12)
-    return false;
-
-  if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
-      !RBI.constrainGenericRegister(SrcReg, Z80::GR16RegClass, MRI))
-    return false;
-
-  bool NeedOrig = llvm::any_of(Steps, [](StepKind S) { return S == ADD_ORIG; });
-
-  // Copy source to HL
-  BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::HL).addReg(SrcReg);
-
-  // If we need original value for additions, save it in DE.
-  // Don't constrain SrcReg to GR16_BCDE — it may conflict with other uses.
-  if (NeedOrig) {
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::DE).addReg(SrcReg);
-  }
-
-  // Execute the steps
-  for (auto Step : Steps) {
-    if (Step == SHIFT) {
-      BuildMI(MBB, MI, DL, TII.get(Z80::ADD_HL_HL));
-    } else {
-      Z80::buildAddHL(MBB, MI, DL, TII, Z80::DE);
-    }
-  }
-
-  // Copy result from HL to dst
-  BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg).addReg(Z80::HL);
 
   MI.eraseFromParent();
   return true;
@@ -3346,83 +3035,7 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
 
     if (MRI.getType(DstReg).getSizeInBits() == 8 &&
         MRI.getType(SrcReg).getSizeInBits() == 16) {
-      // Try to fold trunc(sdiv/srem(sext i8, sext i8)) → 8-bit div/rem
-      // directly. Since GlobalISel selects in reverse order, G_SDIV/G_SREM
-      // hasn't been selected yet, so we can inspect and consume it.
       MachineInstr *SrcDef = MRI.getVRegDef(SrcReg);
-      if (SrcDef &&
-          (SrcDef->getOpcode() == TargetOpcode::G_SDIV ||
-           SrcDef->getOpcode() == TargetOpcode::G_SREM) &&
-          MRI.hasOneNonDBGUse(SrcReg)) {
-        bool IsSDiv = SrcDef->getOpcode() == TargetOpcode::G_SDIV;
-        Register DivSrc1 = SrcDef->getOperand(1).getReg();
-        Register DivSrc2 = SrcDef->getOperand(2).getReg();
-        MachineInstr *Ext1 = MRI.getVRegDef(DivSrc1);
-        MachineInstr *Ext2 = MRI.getVRegDef(DivSrc2);
-        if (Ext1 && Ext2 && Ext1->getOpcode() == TargetOpcode::G_SEXT &&
-            Ext2->getOpcode() == TargetOpcode::G_SEXT) {
-          Register Orig1 = Ext1->getOperand(1).getReg();
-          Register Orig2 = Ext2->getOperand(1).getReg();
-          if (MRI.getType(Orig1).getSizeInBits() == 8 &&
-              MRI.getType(Orig2).getSizeInBits() == 8) {
-            // Found the pattern! Emit 8-bit signed division directly.
-            if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-                !RBI.constrainGenericRegister(Orig1, Z80::GR8RegClass, MRI) ||
-                !RBI.constrainGenericRegister(Orig2, Z80::GR8RegClass, MRI))
-              return false;
-
-            const DebugLoc &DL = MI.getDebugLoc();
-
-            if (MF.getFunction().hasMinSize()) {
-              // -Oz: sign-extend to i16, call __divhi3/__modhi3, truncate.
-              const char *FuncName = IsSDiv ? "__divhi3" : "__modhi3";
-              Module *M = const_cast<Module *>(MF.getFunction().getParent());
-              FunctionCallee Func = M->getOrInsertFunction(
-                  FuncName,
-                  FunctionType::get(Type::getInt16Ty(M->getContext()),
-                                    {Type::getInt16Ty(M->getContext()),
-                                     Type::getInt16Ty(M->getContext())},
-                                    false));
-              GlobalValue *GV = cast<GlobalValue>(Func.getCallee());
-
-              const auto &STI = MF.getSubtarget<Z80Subtarget>();
-              if (STI.hasSM83()) {
-                BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::DE)
-                    .addReg(Orig1);
-                BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::BC)
-                    .addReg(Orig2);
-                BuildMI(MBB, MI, DL, TII.get(Z80::CALL_nn))
-                    .addGlobalAddress(GV)
-                    .addUse(Z80::DE, RegState::Implicit)
-                    .addUse(Z80::BC, RegState::Implicit);
-                BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg)
-                    .addReg(Z80::C);
-              } else {
-                BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::HL)
-                    .addReg(Orig1);
-                BuildMI(MBB, MI, DL, TII.get(Z80::SEXT_GR8_GR16), Z80::DE)
-                    .addReg(Orig2);
-                BuildMI(MBB, MI, DL, TII.get(Z80::CALL_nn))
-                    .addGlobalAddress(GV)
-                    .addUse(Z80::HL, RegState::Implicit)
-                    .addUse(Z80::DE, RegState::Implicit);
-                BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg)
-                    .addReg(Z80::E);
-              }
-            } else {
-              // Inline 8-bit signed division — result directly in i8, no SEXT.
-              BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Z80::E)
-                  .addReg(Orig2);
-              buildAccOp(MBB, MI, DL, IsSDiv ? Z80::SDIV8 : Z80::SMOD8, DstReg,
-                         Orig1, MRI);
-            }
-
-            SrcDef->eraseFromParent(); // erase G_SDIV/G_SREM
-            MI.eraseFromParent();      // erase G_TRUNC
-            return true;
-          }
-        }
-      }
 
       // Fold trunc(ptrtoint(global)) and trunc(lshr(ptrtoint(global), 8))
       // into an 8-bit immediate load of the symbol's low/high address byte.
@@ -3843,46 +3456,45 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
   }
 
   case TargetOpcode::G_MUL:
-    if (selectMulByConst(MI))
-      return true;
     if (selectMul8(MI))
       return true;
     if (STI.inlineI16Runtime())
       return selectInline16(MI, Z80::MUL16);
-    return selectRuntimeLibCall16(MI, "__mulhi3");
-
-  case TargetOpcode::G_UMULH:
-    return selectRuntimeLibCall16(MI, "__umulhi3");
+    return false;
 
   case TargetOpcode::G_SDIV:
     if (selectSDivMod8(MI, /*IsDiv=*/true))
       return true;
     if (STI.inlineI16Runtime())
       return selectInline16(MI, Z80::SDIV16);
-    return selectRuntimeLibCall16(MI, "__divhi3");
+    return false;
 
   case TargetOpcode::G_UDIV:
     if (selectUDivMod8(MI, /*IsDiv=*/true))
       return true;
     if (STI.inlineI16Runtime())
       return selectInline16(MI, Z80::UDIV16);
-    return selectRuntimeLibCall16(MI, "__udivhi3");
+    return false;
+
+  case Z80::G_Z80_SDIV8:
+    return selectSDivMod8(MI, /*IsDiv=*/true);
+
+  case Z80::G_Z80_SREM8:
+    return selectSDivMod8(MI, /*IsDiv=*/false);
 
   case TargetOpcode::G_SREM:
     if (selectSDivMod8(MI, /*IsDiv=*/false))
       return true;
-    if (tryNarrowSRem16(MI))
-      return true;
     if (STI.inlineI16Runtime())
       return selectInline16(MI, Z80::SMOD16);
-    return selectRuntimeLibCall16(MI, "__modhi3");
+    return false;
 
   case TargetOpcode::G_UREM:
     if (selectUDivMod8(MI, /*IsDiv=*/false))
       return true;
     if (STI.inlineI16Runtime())
       return selectInline16(MI, Z80::UMOD16);
-    return selectRuntimeLibCall16(MI, "__umodhi3");
+    return false;
 
   case TargetOpcode::G_UDIVREM:
   case TargetOpcode::G_SDIVREM: {
@@ -3937,14 +3549,9 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
       return false;
 
     bool IsSigned = MI.getOpcode() == TargetOpcode::G_SDIVREM;
-    const char *FuncName = IsSigned ? "__divmodhi4" : "__udivmodhi4";
-    Module *M = const_cast<Module *>(MF.getFunction().getParent());
-    FunctionCallee Func = M->getOrInsertFunction(
-        FuncName, FunctionType::get(Type::getInt16Ty(M->getContext()),
-                                    {Type::getInt16Ty(M->getContext()),
-                                     Type::getInt16Ty(M->getContext())},
-                                    false));
-    GlobalValue *GV = cast<GlobalValue>(Func.getCallee());
+    const char *FuncName = STI.getTargetLowering()->getRequiredLibcallName(
+        IsSigned ? RTLIB::SDIVREM_I16 : RTLIB::UDIVREM_I16,
+        IsSigned ? "16-bit signed divmod" : "16-bit unsigned divmod");
 
     if (STI.hasSM83()) {
       // SM83: DE=dividend, BC=divisor → BC=quot, HL=rem
@@ -3953,7 +3560,7 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::BC)
           .addReg(RHSReg);
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::CALL_nn))
-          .addGlobalAddress(GV)
+          .addExternalSymbol(FuncName)
           .addUse(Z80::DE, RegState::Implicit)
           .addUse(Z80::BC, RegState::Implicit);
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), QuotReg)
@@ -3967,7 +3574,7 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::DE)
           .addReg(RHSReg);
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::CALL_nn))
-          .addGlobalAddress(GV)
+          .addExternalSymbol(FuncName)
           .addUse(Z80::HL, RegState::Implicit)
           .addUse(Z80::DE, RegState::Implicit);
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), QuotReg)
