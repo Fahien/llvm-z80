@@ -1468,40 +1468,18 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
           return true;
         }
         if (DstTy.getSizeInBits() <= 16 && Disp >= -128 && Disp + 1 <= 127) {
-          // 16-bit IX-indexed load.
-          // Choose target register pair based on downstream usage:
-          // if the only use is a COPY to a physical register pair (DE, BC),
-          // load directly into that pair to help the RA coalesce the COPY.
+          // 16-bit IX-indexed load, a byte at a time.
           if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI))
             return false;
-
-          Register TargetPair = Z80::HL;
-          Register LdLoReg = Z80::L;
-          Register LdHiReg = Z80::H;
-
-          if (MRI.hasOneNonDBGUse(DstReg)) {
-            MachineInstr &Use = *MRI.use_nodbg_begin(DstReg)->getParent();
-            if (Use.getOpcode() == TargetOpcode::COPY &&
-                Use.getOperand(0).getReg().isPhysical()) {
-              Register PhysDst = Use.getOperand(0).getReg();
-              if (PhysDst == Z80::DE) {
-                TargetPair = Z80::DE;
-                LdLoReg = Z80::E;
-                LdHiReg = Z80::D;
-              } else if (PhysDst == Z80::BC) {
-                TargetPair = Z80::BC;
-                LdLoReg = Z80::C;
-                LdHiReg = Z80::B;
-              }
-            }
-          }
-
-          Z80::buildLoadIdx(MBB, MI, DL, TII, Z80::LD_r_IXd, LdLoReg, Disp)
-              .addReg(TargetPair, RegState::ImplicitDefine);
-          Z80::buildLoadIdx(MBB, MI, DL, TII, Z80::LD_r_IXd, LdHiReg, Disp + 1)
-              .addReg(TargetPair, RegState::ImplicitDefine);
-          BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg)
-              .addReg(TargetPair);
+          Register Lo = MRI.createVirtualRegister(&Z80::GR8RegClass);
+          Register Hi = MRI.createVirtualRegister(&Z80::GR8RegClass);
+          BuildMI(MBB, MI, DL, TII.get(Z80::LD_r_IXd), Lo).addImm(Disp);
+          BuildMI(MBB, MI, DL, TII.get(Z80::LD_r_IXd), Hi).addImm(Disp + 1);
+          BuildMI(MBB, MI, DL, TII.get(TargetOpcode::REG_SEQUENCE), DstReg)
+              .addReg(Lo)
+              .addImm(Z80::sub_lo)
+              .addReg(Hi)
+              .addImm(Z80::sub_hi);
           MI.eraseFromParent();
           return true;
         }
@@ -2942,27 +2920,20 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
     const LLT DstTy = MRI.getType(DstReg);
     const LLT SrcTy = MRI.getType(SrcReg);
 
-    if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 8) {
-      // s1->s8: just a COPY (s1 already lives in an 8-bit register)
-      if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-          !RBI.constrainGenericRegister(SrcReg, Z80::GR8RegClass, MRI))
-        return false;
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-          .addReg(SrcReg);
-      MI.eraseFromParent();
-      return true;
-    }
     if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 16) {
-      // s8->s16 or s1->s16: copy low byte to L, H is don't-care.
-      // Use implicit-def on H so register allocator knows it's defined.
+      // s8->s16: the high byte is undefined.
       if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
           !RBI.constrainGenericRegister(SrcReg, Z80::GR8RegClass, MRI))
         return false;
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::L)
+      Register Hi = MRI.createVirtualRegister(&Z80::GR8RegClass);
+      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::IMPLICIT_DEF),
+              Hi);
+      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::REG_SEQUENCE),
+              DstReg)
           .addReg(SrcReg)
-          .addReg(Z80::H, RegState::ImplicitDefine);
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-          .addReg(Z80::HL);
+          .addImm(Z80::sub_lo)
+          .addReg(Hi)
+          .addImm(Z80::sub_hi);
       MI.eraseFromParent();
       return true;
     }
@@ -2975,16 +2946,6 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
     const LLT DstTy = MRI.getType(DstReg);
     const LLT SrcTy = MRI.getType(SrcReg);
 
-    if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 8) {
-      // s1->s8: COPY (value is already 0 or 1 in an 8-bit register)
-      if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-          !RBI.constrainGenericRegister(SrcReg, Z80::GR8RegClass, MRI))
-        return false;
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-          .addReg(SrcReg);
-      MI.eraseFromParent();
-      return true;
-    }
     if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 16) {
       // Zero extend 8-bit to 16-bit via pseudo (expanded post-RA)
       if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
@@ -3004,16 +2965,6 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
     const LLT DstTy = MRI.getType(DstReg);
     const LLT SrcTy = MRI.getType(SrcReg);
 
-    if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 8) {
-      // s1->s8: COPY
-      if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
-          !RBI.constrainGenericRegister(SrcReg, Z80::GR8RegClass, MRI))
-        return false;
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-          .addReg(SrcReg);
-      MI.eraseFromParent();
-      return true;
-    }
     if (SrcTy.getSizeInBits() <= 8 && DstTy.getSizeInBits() <= 16) {
       // Sign extend 8-bit to 16-bit via pseudo (expanded post-RA)
       if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
@@ -3076,51 +3027,16 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
       }
     }
 
-    // Dst is s1 or s8 → lives in GR8.
-    // Src is s8 → GR8 (same class, just COPY).
-    // Src is s16 → GR16 (extract low byte via sub_lo).
-    unsigned DstBits = MRI.getType(DstReg).getSizeInBits();
-    unsigned SrcBits = MRI.getType(SrcReg).getSizeInBits();
-
-    if (DstBits > 8 || SrcBits > 16)
+    if (MRI.getType(DstReg).getSizeInBits() != 8 ||
+        MRI.getType(SrcReg).getSizeInBits() != 16)
       return false;
 
-    if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI))
+    if (!RBI.constrainGenericRegister(DstReg, Z80::GR8RegClass, MRI) ||
+        !RBI.constrainGenericRegister(SrcReg, Z80::GR16RegClass, MRI))
       return false;
 
-    const DebugLoc &DL = MI.getDebugLoc();
-    // The low byte is the source itself where that is already a byte, and
-    // otherwise the low half of the pair the source occupies. Naming the half
-    // in place leaves the value wherever it is: moving it into a fixed pair
-    // first would tie the allocator's hands and leave a definition of that
-    // pair which the value outlives.
-    Register LowByte = SrcReg;
-    unsigned LowSubReg = 0;
-
-    if (SrcBits <= 8) {
-      if (!RBI.constrainGenericRegister(SrcReg, Z80::GR8RegClass, MRI))
-        return false;
-    } else {
-      if (!RBI.constrainGenericRegister(SrcReg, Z80::GR16RegClass, MRI))
-        return false;
-      LowSubReg = Z80::sub_lo;
-    }
-
-    if (DstBits == 1) {
-      // The rest of the backend reads an s1 in a GR8 as exactly 0 or 1.
-      // Truncation is the one producer that can leave other bits set.
-      Register Byte = LowByte;
-      if (LowSubReg) {
-        Byte = MRI.createVirtualRegister(&Z80::GR8RegClass);
-        BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), Byte)
-            .addReg(LowByte, RegState{}, LowSubReg);
-      }
-      LowByte = emitAccImm(MBB, MI, DL, Z80::AND_Ac_n, Byte, 1, MRI);
-      LowSubReg = 0;
-    }
-
-    BuildMI(MBB, MI, DL, TII.get(TargetOpcode::COPY), DstReg)
-        .addReg(LowByte, RegState{}, LowSubReg);
+    BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
+        .addReg(SrcReg, RegState{}, Z80::sub_lo);
     MI.eraseFromParent();
     return true;
   }
@@ -3258,66 +3174,16 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
     return false;
   }
 
-  case TargetOpcode::G_SADDO: {
-    // Signed add with overflow detection
-    // %result, %overflow = G_SADDO %a, %b
-    Register DstReg = MI.getOperand(0).getReg();
-    Register OverflowReg = MI.getOperand(1).getReg();
-    Register Src1Reg = MI.getOperand(2).getReg();
-    Register Src2Reg = MI.getOperand(3).getReg();
-    const LLT DstTy = MRI.getType(DstReg);
-    const auto &STI = MF.getSubtarget<Z80Subtarget>();
-
-    if (DstTy.getSizeInBits() <= 16) {
-      if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
-          !RBI.constrainGenericRegister(Src1Reg, Z80::GR16RegClass, MRI) ||
-          !RBI.constrainGenericRegister(Src2Reg, Z80::GR16_BCDERegClass, MRI))
-        return false;
-
-      bool OverflowUsed = !MRI.use_nodbg_empty(OverflowReg);
-      if (OverflowUsed &&
-          !RBI.constrainGenericRegister(OverflowReg, Z80::GR8RegClass, MRI))
-        return false;
-      Register Overflow = OverflowUsed ? OverflowReg : Register();
-
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::HL)
-          .addReg(Src1Reg);
-
-      if (STI.hasSM83()) {
-        // SM83: combined add + overflow detection (no P/V flag), the
-        // overflow coming out in A.
-        buildAccOp(MBB, MI, MI.getDebugLoc(), Z80::SM83_SADDO_HL_rr, Overflow,
-                   Register(), MRI)
-            .addReg(Src2Reg);
-      } else {
-        // Z80: AND A; ADC HL,rr — sets P/V for signed overflow.
-        BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::SADD_HL_rr))
-            .addReg(Src2Reg);
-      }
-
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
-          .addReg(Z80::HL);
-
-      // Z80: CAPTURE_PV reads the P/V flag (bit 2 of F) into A as 0 or 1. It
-      // goes through HL, so the result leaves HL first.
-      if (OverflowUsed && !STI.hasSM83())
-        buildAccOp(MBB, MI, MI.getDebugLoc(), Z80::CAPTURE_PV, Overflow,
-                   Register(), MRI);
-      MI.eraseFromParent();
-      return true;
-    }
-    return false;
-  }
-
+  case TargetOpcode::G_SADDO:
   case TargetOpcode::G_SSUBO: {
-    // Signed subtract with overflow detection
-    // %result, %overflow = G_SSUBO %a, %b
+    // Signed add or subtract with overflow detection
+    // %result, %overflow = G_SADDO/G_SSUBO %a, %b
+    bool IsSub = Opcode == TargetOpcode::G_SSUBO;
     Register DstReg = MI.getOperand(0).getReg();
     Register OverflowReg = MI.getOperand(1).getReg();
     Register Src1Reg = MI.getOperand(2).getReg();
     Register Src2Reg = MI.getOperand(3).getReg();
     const LLT DstTy = MRI.getType(DstReg);
-    const auto &STI = MF.getSubtarget<Z80Subtarget>();
 
     if (DstTy.getSizeInBits() <= 16) {
       if (!RBI.constrainGenericRegister(DstReg, Z80::GR16RegClass, MRI) ||
@@ -3329,31 +3195,23 @@ bool Z80InstructionSelector::select(MachineInstr &MI) {
       if (OverflowUsed &&
           !RBI.constrainGenericRegister(OverflowReg, Z80::GR8RegClass, MRI))
         return false;
-      Register Overflow = OverflowUsed ? OverflowReg : Register();
 
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), Z80::HL)
           .addReg(Src1Reg);
-
-      if (STI.hasSM83()) {
-        // SM83: combined sub + overflow detection (no P/V flag), the
-        // overflow coming out in A.
-        buildAccOp(MBB, MI, MI.getDebugLoc(), Z80::SM83_SSUBO_HL_rr, Overflow,
-                   Register(), MRI)
+      if (OverflowUsed) {
+        Register Tmp = MRI.createVirtualRegister(&Z80::GR16_BCDERegClass);
+        buildAccOp(MBB, MI, MI.getDebugLoc(),
+                   IsSub ? Z80::SSUBO16 : Z80::SADDO16, OverflowReg, Register(),
+                   MRI)
+            .addDef(Tmp, RegState::Dead)
             .addReg(Src2Reg);
       } else {
-        // Z80: AND A; SBC HL,rr — sets P/V for signed overflow.
-        BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(Z80::SUB_HL_rr))
+        BuildMI(MBB, MI, MI.getDebugLoc(),
+                TII.get(IsSub ? Z80::SUB_HL_rr : Z80::ADD_HL_rr))
             .addReg(Src2Reg);
       }
-
       BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(TargetOpcode::COPY), DstReg)
           .addReg(Z80::HL);
-
-      // Z80: CAPTURE_PV reads the P/V flag (bit 2 of F) into A as 0 or 1. It
-      // goes through HL, so the result leaves HL first.
-      if (OverflowUsed && !STI.hasSM83())
-        buildAccOp(MBB, MI, MI.getDebugLoc(), Z80::CAPTURE_PV, Overflow,
-                   Register(), MRI);
       MI.eraseFromParent();
       return true;
     }

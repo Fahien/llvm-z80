@@ -642,14 +642,14 @@ def RELOAD_GR16 : Z80Pseudo<(outs GR16:$dst), (ins i32imm:$fi, i32imm:$offset)> 
 }
 
 // Registers that don't fit the GR16 operand — physical IX/IY, and virtual
-// registers in the wider Anyi16 class — spill through a separate pair rather
+// registers in the wider Any16 class — spill through a separate pair rather
 // than a widened SPILL_GR16: the descriptor's class reaches the register
 // allocator through its temporaries, and widening it perturbs allocation.
-def SPILL_ANY16 : Z80Pseudo<(outs), (ins Anyi16:$src, i32imm:$fi, i32imm:$offset)> {
+def SPILL_ANY16 : Z80Pseudo<(outs), (ins Any16:$src, i32imm:$fi, i32imm:$offset)> {
   let mayStore = true;
   let mayLoad = false;
 }
-def RELOAD_ANY16 : Z80Pseudo<(outs Anyi16:$dst), (ins i32imm:$fi, i32imm:$offset)> {
+def RELOAD_ANY16 : Z80Pseudo<(outs Any16:$dst), (ins i32imm:$fi, i32imm:$offset)> {
   let mayLoad = true;
   let mayStore = false;
   let isReMaterializable = true;
@@ -769,14 +769,6 @@ def SUB_HL_rr : Z80Inst<"sub_hl_rr"> {
   let Defs = [HL, A, FLAGS];
 }
 
-// AND A; ADC HL,rr (signed addition — sets P/V for overflow detection)
-def SADD_HL_rr : Z80Inst<"sadd_hl_rr"> {
-  let InOperandList = (ins GR16_BCDE:$rhs);
-  let OutOperandList = (outs);
-  let Uses = [HL];
-  let Defs = [HL, A, FLAGS];
-}
-
 // ADC HL,rr and SBC HL,rr with the carry or borrow in taken from a register,
 // restored into the flags right before the instruction that reads it. The
 // carry or borrow out is left in the flags.
@@ -798,17 +790,12 @@ def SBC_HL_rr_BI : Z80Inst<"sbc_hl_rr_bi"> {
 
 } // isPseudo, isCodeGenOnly
 
-// CAPTURE_PV: Read the P/V flag (bit 2 of F register) into A as 0 or 1.
-// Expanded in expandPostRAPseudo to: PUSH AF; POP HL; LD A,L; RRCA; RRCA; AND 1
-// Must be atomic (single pseudo) because the RA must not insert stack-modifying
-// instructions between the PUSH AF and POP HL.
-let isPseudo = true, isCodeGenOnly = true in {
-def CAPTURE_PV : Z80Inst<"capture_pv"> {
-  let InOperandList = (ins);
-  let OutOperandList = (outs Ac:$ov);
-  let Uses = [FLAGS];
-  let Defs = [HL, FLAGS];
-}
+// HL plus or minus a pair, with the signed overflow in A as 0 or 1. $tmp is
+// scratch.
+let Uses = [HL], Defs = [HL, FLAGS], Constraints = "@earlyclobber $tmp",
+    mayLoad = false, mayStore = false in {
+  def SADDO16 : Z80Pseudo<(outs Ac:$ov, GR16_BCDE:$tmp), (ins GR16_BCDE:$rhs)>;
+  def SSUBO16 : Z80Pseudo<(outs Ac:$ov, GR16_BCDE:$tmp), (ins GR16_BCDE:$rhs)>;
 }
 
 // Zero extend 8-bit to 16-bit.
@@ -1003,18 +990,6 @@ def SADDSAT8 : Z80Pseudo<(outs Ac:$dst), (ins Ac:$lhs, GR8:$src)>;
 def SSUBSAT8 : Z80Pseudo<(outs Ac:$dst), (ins Ac:$lhs, GR8:$src)>;
 }
 } // mayLoad = false, mayStore = false
-
-// CALL_HL - SM83 indirect call through HL register.
-// Pseudo-instruction that expands to "call __call_hl" in expandPostRAPseudo.
-// The runtime __call_hl trampoline is just "jp (hl)" (1 byte).
-// No register shift needed: SM83 args are in DE/BC, so HL is free for
-// the function pointer.
-let isPseudo = true in
-def CALL_HL : Z80Inst<"call\t__call_hl">, InstCall {
-  let InOperandList = (ins);
-  let Uses = [HL];
-  let Defs = [A, BC, DE, HL, FLAGS];
-}
 
 // Call frame setup/destroy pseudos for stack argument passing.
 // These bracket call sequences where arguments are pushed onto the stack.
