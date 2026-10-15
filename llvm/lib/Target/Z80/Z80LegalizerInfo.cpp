@@ -28,6 +28,7 @@
 #include "llvm/CodeGen/MachineJumpTableInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/IntrinsicsZ80.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -168,15 +169,11 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI) {
       .widenScalarToNextPow2(1)
       .clampScalar(1, S8, S16);
 
-  // Basic ALU operations
-  // For 32-bit and larger, narrow to 16-bit which generates carry chains
-  // widenScalarToNextPow2 ensures non-pow2 types (e.g. s63 from f64 bit
-  // manipulation in Rust core) are widened before narrowScalar operates.
+  // Widen an odd width so that it splits into whole pairs.
   getActionDefinitionsBuilder({G_ADD, G_SUB})
       .legalFor({S8, S16})
       .scalarize(0)
       .widenScalarToNextPow2(0)
-      .narrowScalar(0, LegalizeMutations::changeTo(0, S16))
       .clampScalar(0, S8, S16);
 
   // Widen an odd width so that it splits into whole pairs.
@@ -273,7 +270,8 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI) {
   // Multiply with overflow detection
   // G_UMULO: lower to G_MUL + G_UMULH, overflow = (umulh != 0)
   // G_SMULO: lower to G_MUL + G_SMULH, overflow = (smulh != sign_ext(result))
-  getActionDefinitionsBuilder({G_UMULO, G_SMULO}).lower();
+  getActionDefinitionsBuilder(G_UMULO).widenScalarToNextPow2(0).lower();
+  getActionDefinitionsBuilder(G_SMULO).lower();
 
   // Division - Z80 has no hardware divide
   // i8: custom (inline DJNZ loop in instruction selector, or a call)
@@ -439,9 +437,12 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI) {
   // G_BSWAP: custom lowering using UNMERGE+MERGE to avoid CSE conflict
   // when generic lowerBswap constant-folds and creates duplicate constants
   getActionDefinitionsBuilder(G_BSWAP).customFor({S16}).lower();
-  getActionDefinitionsBuilder({G_BITREVERSE, G_CTPOP}).lower();
-  getActionDefinitionsBuilder(
-      {G_CTLZ, G_CTLZ_ZERO_POISON, G_CTTZ, G_CTTZ_ZERO_POISON})
+  getActionDefinitionsBuilder(G_BITREVERSE)
+      .widenScalarToNextMultipleOf(0, 8)
+      .lower();
+  getActionDefinitionsBuilder({G_CTPOP, G_CTLZ, G_CTLZ_ZERO_POISON, G_CTTZ,
+                               G_CTTZ_ZERO_POISON})
+      .widenScalarToNextMultipleOf(1, 8)
       .lower();
 
   // Extending loads - custom lower to load + extend.
@@ -945,12 +946,19 @@ bool Z80LegalizerInfo::legalizeCustom(LegalizerHelper &Helper, MachineInstr &MI,
   }
 
   case TargetOpcode::G_DYN_STACKALLOC: {
-    // SM83 has no frame pointer register (no IX/IY), so dynamic stack
-    // allocation is not supported — SP-relative offsets break when SP moves.
-    if (MIRBuilder.getMF().getSubtarget<Z80Subtarget>().hasSM83())
-      report_fatal_error(
-          "SM83 does not support dynamic stack allocation "
-          "(alloca/VLA) because it has no frame pointer register");
+    // SM83 has no frame pointer register, so the frame is reached relative to
+    // SP and cannot survive SP moving by an amount known only at run time.
+    if (MIRBuilder.getMF().getSubtarget<Z80Subtarget>().hasSM83()) {
+      const Function &F = MIRBuilder.getMF().getFunction();
+      F.getContext().diagnose(DiagnosticInfoUnsupported(
+          F,
+          "dynamic stack allocation (alloca/VLA) is not supported on SM83, "
+          "which has no frame pointer register",
+          MI.getDebugLoc()));
+      MIRBuilder.buildUndef(MI.getOperand(0).getReg());
+      MI.eraseFromParent();
+      return true;
+    }
 
     // Custom lowering for dynamic stack allocation (alloca/VLA).
     // The generic lowering creates a COPY chain:
